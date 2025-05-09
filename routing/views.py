@@ -32,13 +32,16 @@ def calculate_route_segments(route_coordinates, max_segment_length=MAX_RANGE_MIL
     Split route into segments where each segment is approximately max_segment_length miles long.
     Returns list of segments with actual distances calculated.
     """
+    if len(route_coordinates) < 2:
+        return [route_coordinates], [0]
+
     segments = []
     current_segment = [route_coordinates[0]]
     cumulative_distance = 0
     segment_distances = []
 
     for i in range(1, len(route_coordinates)):
-        prev_point = (route_coordinates[i - 1][1], route_coordinates[i - 1][0])
+        prev_point = (route_coordinates[i-1][1], route_coordinates[i-1][0])
         current_point = (route_coordinates[i][1], route_coordinates[i][0])
         dist = geodesic(prev_point, current_point).miles
         
@@ -46,7 +49,7 @@ def calculate_route_segments(route_coordinates, max_segment_length=MAX_RANGE_MIL
         if cumulative_distance + dist > max_segment_length:
             # Find optimal split point near max_segment_length
             remaining_dist = max_segment_length - cumulative_distance
-            ratio = remaining_dist / dist
+            ratio = remaining_dist / dist if dist > 0 else 0
             split_point = [
                 route_coordinates[i-1][0] + ratio * (route_coordinates[i][0] - route_coordinates[i-1][0]),
                 route_coordinates[i-1][1] + ratio * (route_coordinates[i][1] - route_coordinates[i-1][1])
@@ -226,6 +229,6 @@ class OptimizedRouteView(View):
         lon, lat = coords
         return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
     
-    def generate_cache_key(start, end):
+    def generate_cache_key(self, start, end):
         raw_key = f"{start}|{end}"
         return f"route:{hashlib.md5(raw_key.encode()).hexdigest()}"
