@@ -14,6 +14,7 @@ from django.contrib.gis.db.models.functions import Distance
 from django.contrib.gis.measure import D
 from routing.models import FuelStation
 from math import ceil
+import hashlib
 
 ORS_API_KEY = os.getenv('ORS_API_KEY')
 CLIENT = openrouteservice.Client(key=ORS_API_KEY)
@@ -24,12 +25,6 @@ SEARCH_RADIUS_MILES = 25
 GALLONS_PER_REFUEL = MAX_RANGE_MILES / MPG
 MILES_TO_DEGREES = 1/69
 SRID = 4326
-
-import hashlib
-
-def generate_cache_key(start, end):
-    raw_key = f"{start}|{end}"
-    return f"route:{hashlib.md5(raw_key.encode()).hexdigest()}"
 
 
 def calculate_route_segments(route_coordinates, max_segment_length=MAX_RANGE_MILES):
@@ -155,7 +150,7 @@ class OptimizedRouteView(View):
             if not start or not end:
                 return JsonResponse({"error": "start and end are required"}, status=400)
 
-            cache_key = generate_cache_key(start, end)
+            cache_key = self.generate_cache_key(start, end)
             cached = cache.get(cache_key)
             if cached:
                 return JsonResponse(cached)
@@ -226,8 +221,11 @@ class OptimizedRouteView(View):
 
     def verify_us_location(self, coords):
         """Verify coordinates are within USA bounds"""
-        # Rough bounding box for continental USA
         min_lon, max_lon = -125.0, -66.0
         min_lat, max_lat = 24.0, 50.0
         lon, lat = coords
         return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
+    
+    def generate_cache_key(start, end):
+        raw_key = f"{start}|{end}"
+        return f"route:{hashlib.md5(raw_key.encode()).hexdigest()}"
