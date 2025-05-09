@@ -1,0 +1,6 @@
+django==3.2.23
+requests==2.26.0
+openrouteservice==2.3.3
+geopy==2.4.1
+python-dotenv==1.1.0
+psycopg2-binary==2.9.10
