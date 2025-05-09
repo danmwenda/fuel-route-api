@@ -9,37 +9,139 @@ from django.core.cache import cache
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from geopy.distance import geodesic
-from django.contrib.gis.geos import Point
+from django.contrib.gis.geos import Point, LineString
 from django.contrib.gis.db.models.functions import Distance
+from django.contrib.gis.measure import D
 from routing.models import FuelStation
+from math import ceil
 
 ORS_API_KEY = os.getenv('ORS_API_KEY')
 CLIENT = openrouteservice.Client(key=ORS_API_KEY)
 logger = logging.getLogger(__name__)
+MAX_RANGE_MILES = 500
+MPG = 10
+SEARCH_RADIUS_MILES = 25
+GALLONS_PER_REFUEL = MAX_RANGE_MILES / MPG
+MILES_TO_DEGREES = 1/69
+SRID = 4326
+
+import hashlib
+
+def generate_cache_key(start, end):
+    raw_key = f"{start}|{end}"
+    return f"route:{hashlib.md5(raw_key.encode()).hexdigest()}"
 
 
-def segment_route(route_coordinates, segment_distance=500):
+def calculate_route_segments(route_coordinates, max_segment_length=MAX_RANGE_MILES):
+    """
+    Split route into segments where each segment is approximately max_segment_length miles long.
+    Returns list of segments with actual distances calculated.
+    """
     segments = []
     current_segment = [route_coordinates[0]]
     cumulative_distance = 0
+    segment_distances = []
 
     for i in range(1, len(route_coordinates)):
         prev_point = (route_coordinates[i - 1][1], route_coordinates[i - 1][0])
         current_point = (route_coordinates[i][1], route_coordinates[i][0])
-
         dist = geodesic(prev_point, current_point).miles
-        cumulative_distance += dist
-        current_segment.append(route_coordinates[i])
-
-        if cumulative_distance >= segment_distance:
+        
+        # If adding this segment would exceed max length, finalize current segment
+        if cumulative_distance + dist > max_segment_length:
+            # Find optimal split point near max_segment_length
+            remaining_dist = max_segment_length - cumulative_distance
+            ratio = remaining_dist / dist
+            split_point = [
+                route_coordinates[i-1][0] + ratio * (route_coordinates[i][0] - route_coordinates[i-1][0]),
+                route_coordinates[i-1][1] + ratio * (route_coordinates[i][1] - route_coordinates[i-1][1])
+            ]
+            current_segment.append(split_point)
             segments.append(current_segment)
-            current_segment = [route_coordinates[i]]
-            cumulative_distance = 0
+            segment_distances.append(cumulative_distance + remaining_dist)
+            
+            # Start new segment with the remaining part
+            current_segment = [split_point, route_coordinates[i]]
+            cumulative_distance = dist - remaining_dist
+        else:
+            current_segment.append(route_coordinates[i])
+            cumulative_distance += dist
 
     if len(current_segment) > 1:
         segments.append(current_segment)
+        segment_distances.append(cumulative_distance)
 
-    return segments
+    return segments, segment_distances
+
+
+def find_optimal_fuel_stops(route_segment, segment_distance):
+    """
+    Find optimal fuel stops along a route segment considering:
+    - Stations within SEARCH_RADIUS_MILES of any point in the segment
+    - Cheapest fuel prices
+    - Potentially multiple stops if segment is long
+    """
+    try:
+        # Convert segment to LineString with SRID
+        line = LineString([(lon, lat) for lon, lat in route_segment], srid=SRID)
+
+        # Create a buffer around the line
+        search_area = line.buffer(SEARCH_RADIUS_MILES * MILES_TO_DEGREES)
+
+        # Cache all stations in the buffered area ordered by price
+        stations = list(FuelStation.objects.filter(
+            location__intersects=search_area
+        ).order_by('price'))
+
+        if not stations:
+            return None
+
+        # Determine if we need multiple stops for this segment
+        required_stops = max(1, ceil(segment_distance / MAX_RANGE_MILES))
+        optimal_stops = []
+
+        for i in range(required_stops):
+            # Determine target point along route
+            segment_ratio = (i + 0.5) / required_stops
+            segment_index = min(int(len(route_segment) * segment_ratio), len(route_segment) - 1)
+            stop_point = route_segment[segment_index]
+
+            # Create Point with SRID
+            point = Point(stop_point[0], stop_point[1], srid=SRID)
+
+            # Filter stations near this point within SEARCH_RADIUS_MILES
+            nearby = sorted(
+                [s for s in stations if s.location.distance(point) <= D(mi=SEARCH_RADIUS_MILES).m],
+                key=lambda s: (s.price, s.location.distance(point))
+            )
+
+            if nearby:
+                nearest_cheapest = nearby[0]
+                gallons = min(segment_distance / required_stops, MAX_RANGE_MILES) / MPG
+                cost = round(nearest_cheapest.price * gallons, 2)
+
+                loc = nearest_cheapest.location
+                longitude = loc.x if hasattr(loc, 'x') else None
+                latitude = loc.y if hasattr(loc, 'y') else None
+
+                optimal_stops.append({
+                    "location": nearest_cheapest.name,
+                    "address": nearest_cheapest.address,
+                    "city": nearest_cheapest.city,
+                    "state": nearest_cheapest.state,
+                    "price": nearest_cheapest.price,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "gallons": round(gallons, 2),
+                    "cost": cost,
+                    "segment_distance": round(segment_distance / required_stops, 2)
+                })
+
+        return optimal_stops if optimal_stops else None
+
+    except Exception as e:
+        logger.error(f"Error finding fuel stops: {str(e)}")
+        return None
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -49,10 +151,11 @@ class OptimizedRouteView(View):
             data = json.loads(request.body)
             start = data.get('start')
             end = data.get('end')
+            
             if not start or not end:
                 return JsonResponse({"error": "start and end are required"}, status=400)
 
-            cache_key = f"route:{start}:{end}"
+            cache_key = generate_cache_key(start, end)
             cached = cache.get(cache_key)
             if cached:
                 return JsonResponse(cached)
@@ -62,6 +165,9 @@ class OptimizedRouteView(View):
 
             if not start_coords or not end_coords:
                 return JsonResponse({"error": "Unable to geocode start or end location."}, status=400)
+            
+            if not self.verify_us_location(start_coords) or not self.verify_us_location(end_coords):
+                return JsonResponse({"error": "Both locations must be within the USA"}, status=400)
 
             route = CLIENT.directions(
                 coordinates=[start_coords, end_coords],
@@ -70,16 +176,16 @@ class OptimizedRouteView(View):
             )
 
             route_coords = route['features'][0]['geometry']['coordinates']
-            segments = segment_route(route_coords)
+            segments, segment_distances = calculate_route_segments(route_coords)
 
             fuel_stops = []
-            for segment in segments:
-                stop = self.get_cheapest_fuel_stop_postgis(segment)
-                if stop:
-                    gallons = 500 / 10
-                    cost = round(stop['price'] * gallons, 2)
-                    stop.update({"gallons": gallons, "cost": cost})
-                    fuel_stops.append(stop)
+            for segment, distance in zip(segments, segment_distances):
+                stops = find_optimal_fuel_stops(segment, distance)
+                if stops:
+                    fuel_stops.extend(stops)
+
+            if not fuel_stops:
+                return JsonResponse({"error": "No fuel stations found along the route"}, status=404)
 
             total_fuel_cost = sum(stop["cost"] for stop in fuel_stops)
 
@@ -93,8 +199,7 @@ class OptimizedRouteView(View):
 
             response_data = {
                 "route_map_url": map_url,
-                "fuel_stops": fuel_stops,
-                "total_fuel_cost": round(total_fuel_cost, 2)
+                "total_fuel_cost": round(total_fuel_cost, 2),
             }
 
             cache.set(cache_key, response_data, timeout=3600)
@@ -105,6 +210,7 @@ class OptimizedRouteView(View):
             return JsonResponse({"error": str(e)}, status=500)
 
     def get_coordinates(self, location):
+        """Get coordinates for a location string using Nominatim"""
         url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json&limit=1"
         headers = {'User-Agent': 'fuel-route-app/1.0'}
         try:
@@ -112,45 +218,16 @@ class OptimizedRouteView(View):
             if res.status_code == 200:
                 data = res.json()
                 if data:
-                    country = None
-                    if 'address' in data[0]:
-                        country = data[0]['address'].get('country')
-                    if not country and 'display_name' in data[0]:
-                        display_parts = data[0]['display_name'].split(',')
-                        if display_parts:
-                            country = display_parts[-1].strip()
-
-                    if country and country.lower() in ['united states', 'usa']:
-                        return float(data[0]['lon']), float(data[0]['lat'])
+                    return float(data[0]['lon']), float(data[0]['lat'])
             return None
         except (requests.RequestException, ValueError, KeyError, IndexError) as e:
-            print(f"Error getting coordinates for {location}: {e}")
+            logger.error(f"Error getting coordinates for {location}: {e}")
             return None
 
-
-
-    def get_cheapest_fuel_stop_postgis(self, segment):
-        lat_lon_points = [(lat, lon) for lon, lat in segment]
-        avg_lat = sum(lat for lat, _ in lat_lon_points) / len(lat_lon_points)
-        avg_lon = sum(lon for _, lon in lat_lon_points) / len(lat_lon_points)
-        center_point = Point(avg_lon, avg_lat, srid=4326)
-
-        stations = FuelStation.objects.annotate(
-            distance=Distance('location', center_point)
-        ).filter(
-            distance__lte=16093.4
-        ).order_by('price')
-
-        if stations.exists():
-            s = stations.first()
-            return {
-                "location": s.name,
-                "address": s.address,
-                "city": s.city,
-                "state": s.state,
-                "price": s.price,
-                "latitude": s.location.y,
-                "longitude": s.location.x,
-            }
-
-        return None
+    def verify_us_location(self, coords):
+        """Verify coordinates are within USA bounds"""
+        # Rough bounding box for continental USA
+        min_lon, max_lon = -125.0, -66.0
+        min_lat, max_lat = 24.0, 50.0
+        lon, lat = coords
+        return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
