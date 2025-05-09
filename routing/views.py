@@ -82,9 +82,14 @@ class OptimizedRouteView(View):
                     fuel_stops.append(stop)
 
             total_fuel_cost = sum(stop["cost"] for stop in fuel_stops)
-            start_str = f"{start_coords[1]},{start_coords[0]}"
-            end_str = f"{end_coords[1]},{end_coords[0]}"
-            map_url = f"https://maps.openrouteservice.org/directions?n1={start_coords[1]}&n2={start_coords[0]}&a={start_str},{end_str}&b=0&c=0&k1=en-US&k2=mi"
+
+            waypoints = [start_coords]
+            for stop in fuel_stops:
+                waypoints.append((stop['longitude'], stop['latitude']))
+            waypoints.append(end_coords)
+
+            a_param = ",".join(f"{lat},{lon}" for lon, lat in waypoints)
+            map_url = f"https://maps.openrouteservice.org/directions?n1={start_coords[1]}&n2={start_coords[0]}&a={a_param}&b=0&c=0&k1=en-US&k2=mi"
 
             response_data = {
                 "route_map_url": map_url,
@@ -133,7 +138,7 @@ class OptimizedRouteView(View):
         stations = FuelStation.objects.annotate(
             distance=Distance('location', center_point)
         ).filter(
-            distance__lte=24140
+            distance__lte=16093.4
         ).order_by('price')
 
         if stations.exists():
@@ -144,6 +149,8 @@ class OptimizedRouteView(View):
                 "city": s.city,
                 "state": s.state,
                 "price": s.price,
+                "latitude": s.location.y,
+                "longitude": s.location.x,
             }
 
         return None
